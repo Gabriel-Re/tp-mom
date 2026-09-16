@@ -69,13 +69,76 @@ func (q *QueueMiddleware) Send(msg m.Message) error {
 		return fmt.Errorf("send: %w: %w", m.ErrMessageMiddlewareMessage, err)
 	}
 
-	log.Printf("queue %q: publica sin error, body=%q", q.name, msg.Body)
+	log.Printf("queue %q: published without error, body=%q", q.name, msg.Body)
 	return nil
 }
 
 func (q *QueueMiddleware) StartConsuming(callback func(m.Message, func(), func())) error {
-	// TODO
-	return fmt.Errorf("consumption not implemented")
+	if q.closed || q.conn.IsClosed() {
+		return fmt.Errorf("consume: %w", m.ErrMessageMiddlewareDisconnected)
+	}
+	if callback == nil {
+		return fmt.Errorf("consume: %w: nil callback", m.ErrMessageMiddlewareMessage)
+	}
+
+	// Canal AMQP
+	err := q.channel.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	if err != nil {
+		if q.conn.IsClosed() {
+			return fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+		}
+		return fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareMessage, err)
+	}
+
+	// Canal de go donde recibo los mensajes
+	messages, err := q.channel.Consume(
+		q.name, // queue
+		"",     // consumer
+		false,  // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	if err != nil {
+		if q.conn.IsClosed() {
+			return fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+		}
+		return fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareMessage, err)
+	}
+
+	for delivery := range messages {
+		// Callback debe llamar a ack o nack antes de retornar, en la misma goroutine
+		var confirmationErr error
+		ack := func() {
+			if confirmationErr == nil {
+				confirmationErr = delivery.Ack(false)
+			}
+		}
+		nack := func() {
+			if confirmationErr == nil {
+				// Reencolo solo esta entrega para que pueda procesarse otra vez.
+				confirmationErr = delivery.Nack(false, true)
+			}
+		}
+		log.Printf("queue %q: recibe body=%q", q.name, delivery.Body)
+		callback(m.Message{Body: string(delivery.Body)}, ack, nack)
+		if confirmationErr != nil {
+			if q.conn.IsClosed() {
+				return fmt.Errorf("confirm delivery: %w: %w", m.ErrMessageMiddlewareDisconnected, confirmationErr)
+			}
+			return fmt.Errorf("confirm delivery: %w: %w", m.ErrMessageMiddlewareMessage, confirmationErr)
+		}
+	}
+
+	if q.conn.IsClosed() {
+		return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareDisconnected)
+	}
+	return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareMessage)
 }
 
 func (q *QueueMiddleware) StopConsuming() error {
