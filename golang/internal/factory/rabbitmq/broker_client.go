@@ -101,11 +101,19 @@ func (c *BrokerClient) Publish(exchange string, keys []string, msg m.Message) er
 }
 
 func (c *BrokerClient) StartConsuming(queueName string, callback func(m.Message, func(), func())) error {
+	return c.consume(queueName, "", nil, callback)
+}
+
+func (c *BrokerClient) StartExchangeConsuming(exchange string, keys []string, callback func(m.Message, func(), func())) error {
+	return c.consume("", exchange, keys, callback)
+}
+
+func (c *BrokerClient) consume(queueName string, exchange string, keys []string, callback func(m.Message, func(), func())) error {
 	if callback == nil {
 		return fmt.Errorf("consume: %w: nil callback", m.ErrMessageMiddlewareMessage)
 	}
 	
-	messages, err := c.startConsumer(queueName)
+	messages, err := c.startConsumer(queueName, exchange, keys)
 	if err != nil {
 		return err
 	}
@@ -130,7 +138,7 @@ func (c *BrokerClient) StartConsuming(queueName string, callback func(m.Message,
 				confirmationErr = delivery.Nack(false, true)
 			}
 		}
-		log.Printf("queue %q: recibe body=%q", queueName, delivery.Body)
+		log.Printf("routing key %q: recibe body=%q", delivery.RoutingKey, delivery.Body)
 		callback(m.Message{Body: string(delivery.Body)}, ack, nack)
 
 		if confirmationErr != nil {
@@ -163,7 +171,7 @@ func (c *BrokerClient) StartConsuming(queueName string, callback func(m.Message,
 	return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareMessage)
 }
 
-func (c *BrokerClient) startConsumer(queueName string) (<-chan amqp.Delivery, error) {
+func (c *BrokerClient) startConsumer(queueName string, exchange string, keys []string) (<-chan amqp.Delivery, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	
@@ -187,6 +195,16 @@ func (c *BrokerClient) startConsumer(queueName string) (<-chan amqp.Delivery, er
 		return nil, fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareMessage, err)
 	}
 
+	if exchange != "" {
+		queueName, err = c.declareSubscription(exchange, keys)
+		if err != nil {
+			if c.conn.IsClosed() {
+				return nil, fmt.Errorf("subscribe: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+			}
+			return nil, fmt.Errorf("subscribe: %w: %w", m.ErrMessageMiddlewareMessage, err)
+		}
+	}
+
 	// Canal de go donde recibo los mensajes
 	messages, err := c.channel.Consume(
 		queueName,      // queue
@@ -198,6 +216,11 @@ func (c *BrokerClient) startConsumer(queueName string) (<-chan amqp.Delivery, er
 		nil,         // args
 	)
 	if err != nil {
+		if exchange != "" && !c.channel.IsClosed() {
+			if _, cleanupErr := c.channel.QueueDelete(queueName, false, false, false); cleanupErr != nil {
+				err = fmt.Errorf("%w; cleanup: %w", err, cleanupErr)
+			}
+		}
 		if c.conn.IsClosed() {
 			return nil, fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
 		}
@@ -207,6 +230,41 @@ func (c *BrokerClient) startConsumer(queueName string) (<-chan amqp.Delivery, er
 	c.consuming = true
 	c.stopping = false
 	return messages, nil
+}
+
+// Mu tomado para no intercalar con StopConsuming o Close
+func (c *BrokerClient) declareSubscription(exchange string, keys []string) (string, error) {
+	queue, err := c.channel.QueueDeclare(
+		"",    // name
+		false, // durable
+		true,  // delete when unused
+		true,  // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	if err != nil {
+		return "", err
+	}
+
+	// Cada suscriptor tiene su cola; todas sus keys apuntan a ella.
+	for _, key := range keys {
+		err = c.channel.QueueBind(
+			queue.Name, // queue name
+			key,        // routing key
+			exchange,   // exchange
+			false,      // no-wait
+			nil,        // arguments
+		)
+		if err != nil {
+			if !c.channel.IsClosed() {
+				if _, cleanupErr := c.channel.QueueDelete(queue.Name, false, false, false); cleanupErr != nil {
+					err = fmt.Errorf("%w; cleanup: %w", err, cleanupErr)
+				}
+			}
+			return "", err
+		}
+	}
+	return queue.Name, nil
 }
 
 func (c *BrokerClient) StopConsuming() error {

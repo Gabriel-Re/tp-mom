@@ -41,12 +41,11 @@ func (e *ExchangeMiddleware) Send(msg m.Message) error {
 }
 
 func (e *ExchangeMiddleware) StartConsuming(callback func(m.Message, func(), func())) error {
-	// TODO: crear la cola privada y los binds
-	return fmt.Errorf("consume: %w: exchange consumption not implemented", m.ErrMessageMiddlewareMessage)
+	// Creo la cola privada y los binds
+	return e.brokerClient.StartExchangeConsuming(e.name, e.keys, callback)
 }
 
 func (e *ExchangeMiddleware) StopConsuming() error {
-	// Todavia no se registra ningun consumidor
 	return e.brokerClient.StopConsuming()
 }
 
