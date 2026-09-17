@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
 	m "github.com/7574-sistemas-distribuidos/tp-mom/golang/internal/middleware"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+const consumerTag = "queue-consumer"
+
 type QueueMiddleware struct {
+	mu        sync.Mutex
+	consuming bool
+	stopping  bool
 	name    string
 	conn    *amqp.Connection
 	channel *amqp.Channel
@@ -49,6 +55,9 @@ func NewQueueMiddleware(name string, settings m.ConnSettings) (m.Middleware, err
 }
 
 func (q *QueueMiddleware) Send(msg m.Message) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	if q.closed || q.conn.IsClosed() {
 		return fmt.Errorf("send: %w", m.ErrMessageMiddlewareDisconnected)
 	}
@@ -74,42 +83,20 @@ func (q *QueueMiddleware) Send(msg m.Message) error {
 }
 
 func (q *QueueMiddleware) StartConsuming(callback func(m.Message, func(), func())) error {
-	if q.closed || q.conn.IsClosed() {
-		return fmt.Errorf("consume: %w", m.ErrMessageMiddlewareDisconnected)
-	}
 	if callback == nil {
 		return fmt.Errorf("consume: %w: nil callback", m.ErrMessageMiddlewareMessage)
 	}
-
-	// Canal AMQP
-	err := q.channel.Qos(
-		1,     // prefetch count
-		0,     // prefetch size
-		false, // global
-	)
+	
+	messages, err := q.startConsumer()
 	if err != nil {
-		if q.conn.IsClosed() {
-			return fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
-		}
-		return fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareMessage, err)
+		return err
 	}
 
-	// Canal de go donde recibo los mensajes
-	messages, err := q.channel.Consume(
-		q.name, // queue
-		"",     // consumer
-		false,  // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	if err != nil {
-		if q.conn.IsClosed() {
-			return fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
-		}
-		return fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareMessage, err)
-	}
+	defer func() {
+		q.mu.Lock()
+		q.consuming = false
+		q.mu.Unlock()
+	}()
 
 	for delivery := range messages {
 		// Callback debe llamar a ack o nack antes de retornar, en la misma goroutine
@@ -127,7 +114,18 @@ func (q *QueueMiddleware) StartConsuming(callback func(m.Message, func(), func()
 		}
 		log.Printf("queue %q: recibe body=%q", q.name, delivery.Body)
 		callback(m.Message{Body: string(delivery.Body)}, ack, nack)
+
 		if confirmationErr != nil {
+			q.mu.Lock()
+			closed := q.closed
+			q.mu.Unlock()
+
+			if closed {
+				// El cierre local interrumpio la confirmacion.
+				// RabbitMQ reencola las entregas que quedaron sin confirmar al cerrar el canal
+				return nil
+			}
+
 			if q.conn.IsClosed() {
 				return fmt.Errorf("confirm delivery: %w: %w", m.ErrMessageMiddlewareDisconnected, confirmationErr)
 			}
@@ -135,18 +133,94 @@ func (q *QueueMiddleware) StartConsuming(callback func(m.Message, func(), func()
 		}
 	}
 
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	
+	if q.closed || q.stopping {
+		return nil
+	}
 	if q.conn.IsClosed() {
 		return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareDisconnected)
 	}
 	return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareMessage)
 }
 
+func (q *QueueMiddleware) startConsumer() (<-chan amqp.Delivery, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	
+	if q.closed || q.conn.IsClosed() {
+		return nil, fmt.Errorf("consume: %w", m.ErrMessageMiddlewareDisconnected)
+	}
+	if q.consuming {
+		return nil, fmt.Errorf("consume: %w: consumer already running", m.ErrMessageMiddlewareMessage)
+	}
+
+	// Canal AMQP
+	err := q.channel.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	if err != nil {
+		if q.conn.IsClosed() {
+			return nil, fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+		}
+		return nil, fmt.Errorf("set qos: %w: %w", m.ErrMessageMiddlewareMessage, err)
+	}
+
+	// Canal de go donde recibo los mensajes
+	messages, err := q.channel.Consume(
+		q.name,      // queue
+		consumerTag, // consumer
+		false,       // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+	if err != nil {
+		if q.conn.IsClosed() {
+			return nil, fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+		}
+		return nil, fmt.Errorf("consume: %w: %w", m.ErrMessageMiddlewareMessage, err)
+	}
+
+	q.consuming = true
+	q.stopping = false
+	return messages, nil
+}
+
 func (q *QueueMiddleware) StopConsuming() error {
-	// TODO
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	
+	if q.closed {
+		return nil
+	}
+	if q.conn.IsClosed() {
+		return fmt.Errorf("stop consuming: %w", m.ErrMessageMiddlewareDisconnected)
+	}
+	if !q.consuming || q.stopping {
+		return nil
+	}
+
+	// Cancel cierra el canal
+	// no espero al callback con el lock tomado
+	if err := q.channel.Cancel(consumerTag, false); err != nil {
+		if q.conn.IsClosed() {
+			return fmt.Errorf("stop consuming: %w: %w", m.ErrMessageMiddlewareDisconnected, err)
+		}
+		return fmt.Errorf("stop consuming: %w: %w", m.ErrMessageMiddlewareMessage, err)
+	}
+	q.stopping = true
 	return nil
 }
 
 func (q *QueueMiddleware) Close() error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	if q.closed {
 		return nil
 	}
