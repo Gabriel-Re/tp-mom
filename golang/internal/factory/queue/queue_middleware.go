@@ -2,7 +2,7 @@ package queue
 
 import (
 	"fmt"
-	"log"
+	//"log"
 
 	m "github.com/7574-sistemas-distribuidos/tp-mom/golang/internal/middleware"
 	"github.com/7574-sistemas-distribuidos/tp-mom/golang/internal/factory/rabbitmq"
@@ -37,7 +37,7 @@ func (q *QueueMiddleware) Send(msg m.Message) error {
 	if err := q.brokerClient.Publish("", []string{q.name}, msg); err != nil {
 		return err
 	}
-	log.Printf("queue %q: published without error, body=%q", q.name, msg.Body)
+	//log.Printf("queue %q: published without error, body=%q", q.name, msg.Body)
 	return nil
 }
 

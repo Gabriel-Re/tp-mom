@@ -2,8 +2,9 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	//"log"
 	"sync"
 
 	m "github.com/7574-sistemas-distribuidos/tp-mom/golang/internal/middleware"
@@ -95,7 +96,7 @@ func (c *BrokerClient) Publish(exchange string, keys []string, msg m.Message) er
 			}
 			return fmt.Errorf("send key %q: %w: %w", key, m.ErrMessageMiddlewareMessage, err)
 		}
-		log.Printf("exchange %q: published without error, key=%q, body=%q", exchange, key, msg.Body)
+		//log.Printf("exchange %q: published without error, key=%q, body=%q", exchange, key, msg.Body)
 	}
 	return nil
 }
@@ -127,18 +128,22 @@ func (c *BrokerClient) consume(queueName string, exchange string, keys []string,
 	for delivery := range messages {
 		// Callback debe llamar a ack o nack antes de retornar, en la misma goroutine
 		var confirmationErr error
+		confirmed := false
+		// Solo la primera cuenta
 		ack := func() {
-			if confirmationErr == nil {
+			if !confirmed {
+				confirmed = true
 				confirmationErr = delivery.Ack(false)
 			}
 		}
 		nack := func() {
-			if confirmationErr == nil {
-				// Reencolo solo esta entrega para que pueda procesarse otra vez.
+			if !confirmed {
+				confirmed = true
+				// Reencolo solo esta entrega para que pueda procesarse otra vez
 				confirmationErr = delivery.Nack(false, true)
 			}
 		}
-		log.Printf("routing key %q: recibe body=%q", delivery.RoutingKey, delivery.Body)
+		//log.Printf("routing key %q: recibe body=%q", delivery.RoutingKey, delivery.Body)
 		callback(m.Message{Body: string(delivery.Body)}, ack, nack)
 
 		if confirmationErr != nil {
@@ -162,11 +167,14 @@ func (c *BrokerClient) consume(queueName string, exchange string, keys []string,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	
-	if c.closed || c.stopping {
+	if c.closed {
 		return nil
 	}
 	if c.conn.IsClosed() {
 		return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareDisconnected)
+	}
+	if c.stopping {
+		return nil
 	}
 	return fmt.Errorf("consume: %w: deliveries channel closed", m.ErrMessageMiddlewareMessage)
 }
@@ -216,8 +224,8 @@ func (c *BrokerClient) startConsumer(queueName string, exchange string, keys []s
 		nil,         // args
 	)
 	if err != nil {
-		if exchange != "" && !c.channel.IsClosed() {
-			if _, cleanupErr := c.channel.QueueDelete(queueName, false, false, false); cleanupErr != nil {
+		if exchange != ""{
+			if cleanupErr := c.deleteSubscription(queueName); cleanupErr != nil {
 				err = fmt.Errorf("%w; cleanup: %w", err, cleanupErr)
 			}
 		}
@@ -256,15 +264,35 @@ func (c *BrokerClient) declareSubscription(exchange string, keys []string) (stri
 			nil,        // arguments
 		)
 		if err != nil {
-			if !c.channel.IsClosed() {
-				if _, cleanupErr := c.channel.QueueDelete(queue.Name, false, false, false); cleanupErr != nil {
-					err = fmt.Errorf("%w; cleanup: %w", err, cleanupErr)
-				}
+			if cleanupErr := c.deleteSubscription(queue.Name); cleanupErr != nil {
+				err = fmt.Errorf("%w; cleanup: %w", err, cleanupErr)
 			}
 			return "", err
 		}
 	}
 	return queue.Name, nil
+}
+
+// Mu tomado. Un error de binding puede cerrar el canal original, pero dejar la cola.
+func (c *BrokerClient) deleteSubscription(name string) (err error) {
+	if c.conn.IsClosed() {
+		// RabbitMQ elimina las colas exclusivas al cerrar su conexion.
+		return nil
+	}
+	channel := c.channel
+	if channel.IsClosed() {
+		channel, err = c.conn.Channel()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if closeErr := channel.Close(); closeErr != nil && !errors.Is(closeErr, amqp.ErrClosed) {
+				err = errors.Join(err, closeErr)
+			}
+		}()
+	}
+	_, err = channel.QueueDelete(name, false, false, false)
+	return err
 }
 
 func (c *BrokerClient) StopConsuming() error {
@@ -304,7 +332,7 @@ func (c *BrokerClient) Close() error {
 
 	// Si no se pudo abrir el canal, solo hay una conex
 	if c.channel == nil {
-		if err := c.conn.Close(); err != nil {
+		if err := c.conn.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
 			return fmt.Errorf("close connection: %w: %w", m.ErrMessageMiddlewareClose, err)
 		}
 		return nil
@@ -313,6 +341,13 @@ func (c *BrokerClient) Close() error {
 	// Intento cerrar ambos
 	channelErr := c.channel.Close()
 	connectionErr := c.conn.Close()
+	// Si RabbitMQ ya los cerro, no queda ningun recurso pendiente de cerrar.
+	if errors.Is(channelErr, amqp.ErrClosed) {
+		channelErr = nil
+	}
+	if errors.Is(connectionErr, amqp.ErrClosed) {
+		connectionErr = nil
+	}
 	if channelErr != nil && connectionErr != nil {
 		return fmt.Errorf("%w: close channel: %w; close connection: %w", m.ErrMessageMiddlewareClose, channelErr, connectionErr)
 	}
